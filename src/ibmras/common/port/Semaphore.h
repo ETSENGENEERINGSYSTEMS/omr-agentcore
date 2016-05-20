@@ -20,9 +20,6 @@
 
 #include <vector>
 #include <string>
-#if defined (_MACH_)
-#include <semaphore.h>
-#endif
 
 #ifndef NULL
 #define NULL 0
@@ -42,13 +39,10 @@ public:
 	bool wait(uint32 timeout);								/* decrement the semaphore count */
 	~Semaphore();											/* OS cleanup of semaphore */
 private:
-
-#if defined(_MACH_)
-	semaphore_t* handle;
-#else
 	void* handle;											/* opaque handle to platform data structure */
+#if defined __MACH__
+    std::string name;
 #endif
-
 };
 
 }

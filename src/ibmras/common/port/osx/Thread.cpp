@@ -19,21 +19,24 @@
  */
 #define _XOPEN_SOURCE_EXTENDED 1
 #include "pthread.h"
-#include "time.h"
+#include <time.h>
 #include <sys/time.h>
 #include <errno.h>
 #include <mach/clock.h>
 #include <mach/mach.h>
 #include <mach/task.h>
-#include <mach/semaphore.h>
-#include <sys/sem.h>
-#include <sys/ipc.h>
-#include <dispatch/dispatch.h>
+#include <fcntl.h>           /* For O_* constants */
+#include <sys/stat.h>        /* For mode constants */
+#include <semaphore.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 
 #include "ibmras/common/port/ThreadData.h"
 #include "ibmras/common/port/Semaphore.h"
 #include "ibmras/common/logging.h"
+#include "ibmras/common/common.h"
+#include "ibmras/common/util/sysUtils.h"
 #include <map>
 #include <stack>
 #include <list>
@@ -107,15 +110,13 @@ void sleep(uint32 seconds) {
 	pthread_mutex_unlock(&condMapMux);
 	pthread_mutex_lock(&m);
 
-	struct timespec t;
-	clock_serv_t cclock;
-	mach_timespec_t mts;
-	host_get_clock_service(mach_host_self(), CALENDAR_CLOCK, &cclock);
-	clock_get_time(cclock, &mts);
-	mach_port_deallocate(mach_task_self(), cclock);
-	t.tv_sec = mts.tv_sec+seconds;
+	struct timeval tv;
+    struct timespec ts;
+    gettimeofday(&tv, NULL);
+    ts.tv_sec = tv.tv_sec + seconds;
+    ts.tv_nsec = 0;
 	IBMRAS_DEBUG_1(finest,"Sleeping for %d seconds", seconds);
-	pthread_cond_timedwait(&c, &m, &t);
+	pthread_cond_timedwait(&c, &m, &ts);
 	IBMRAS_DEBUG(finest,"Woke up");
 	pthread_mutex_unlock(&m);
 	pthread_mutex_lock(&condMapMux);
@@ -140,24 +141,42 @@ void stopAllThreads() {
 	stopping = true;
 	// wake currently sleeping threads
 	condBroadcast();
+    /* 
 	while (!threadMap.empty()) {
 		pthread_cancel(threadMap.top());
 		//wait for the thread to stop
 		pthread_join(threadMap.top(), NULL);
 		threadMap.pop();
 	}
+    */ 
 	pthread_mutex_unlock(&threadMapMux);
 }
 
 Semaphore::Semaphore(uint32 initial, uint32 max) {
 	if (!stopping) {
-		IBMRAS_DEBUG(fine,"in thread.cpp creating CreateSemaphoreA");
-        mach_port_t task = mach_task_self();
-        kern_return_t err;
+        name = "/hc/";
+        name.append(ibmras::common::itoa(getpid()));
+        name.append("/");
+        name.append(ibmras::common::itoa(pthread_self()));
+		handle = new sem_t;
+		IBMRAS_DEBUG_1(fine, "in thread.cpp creating semaphore %s", name.c_str());
 
-		err = semaphore_create(task, reinterpret_cast<semaphore_t*>(handle), SYNC_POLICY_FIFO, initial);
-		if(err != KERN_SUCCESS) {
-			IBMRAS_DEBUG(warning, "Failed to create semaphore");
+		handle = sem_open(name.c_str(), O_CREAT | O_EXCL, S_IRWXU | S_IRWXG | S_IRWXO, initial);
+        int i=0;
+		if (handle == SEM_FAILED) {
+            while (i<=20) {
+                std::string i_string = ibmras::common::itoa(i);
+                name.replace(name.length()-i_string.length(), i_string.length(), i_string);
+                IBMRAS_DEBUG_1(fine, "Failed; creating semaphore %s", name.c_str());
+                handle = sem_open(name.c_str(), O_CREAT | O_EXCL, S_IRWXU | S_IRWXG | S_IRWXO, initial);
+                if (handle == SEM_FAILED) {
+                    i++;
+                } else {
+                    return;
+                }
+            }
+			IBMRAS_DEBUG(warning, "Failed to create semaphore : error code SEM_FAILED\n");
+			handle = NULL;
 		}
 	} else {
 		IBMRAS_DEBUG(debug,"Trying to stop - semaphore not created");
@@ -166,37 +185,40 @@ Semaphore::Semaphore(uint32 initial, uint32 max) {
 }
 
 void Semaphore::inc() {
-	IBMRAS_DEBUG(finest, "Incrementing semaphore ticket count");
-	if(handle) {
-        semaphore_t* semTP = reinterpret_cast<semaphore_t*>(handle);
-		semaphore_signal(*semTP);
+	IBMRAS_DEBUG_1(finest, "Incrementing semaphore %s ticket count\n", name.c_str());
+	if (handle) {
+		sem_post(reinterpret_cast<sem_t*>(handle));
 	}
 }
 
 bool Semaphore::wait(uint32 timeout) {
-	kern_return_t err;
-	while(!handle) {
+	int result;
+	while (!handle) {
 		sleep(timeout);		/* wait for the semaphore to be established */
 	}
-	IBMRAS_DEBUG(finest, "semaphore wait");
-    mach_timespec_t ts;
-    ts.tv_sec = timeout;
-    ts.tv_nsec = 0;
-    semaphore_t* semTP = reinterpret_cast<semaphore_t*>(handle);
-	err = semaphore_timedwait(*semTP, ts);
-	if(err == KERN_SUCCESS) {
-		IBMRAS_DEBUG(finest, "semaphore posted");
+	IBMRAS_DEBUG_1(finest, "semaphore %s wait\n", name.c_str());
+
+    //best can do here as OSX doesn't do sem_timedwait; trywait returns immediately
+    //and we can check the result to see if we need to sleep and try again.
+
+	result = sem_trywait(reinterpret_cast<sem_t*>(handle));
+    if (result == -1 && errno == EAGAIN) {
+        ibmras::common::port::sleep(timeout);
+        result = sem_trywait(reinterpret_cast<sem_t*>(handle)); 
+    }
+
+	if(!result) {
+		IBMRAS_DEBUG_1(finest, "semaphore %s posted\n", name.c_str());
 		return true;
 	}
 
-	IBMRAS_DEBUG(finest, "semaphore timeout");
-	return (err != KERN_OPERATION_TIMED_OUT);
+	IBMRAS_DEBUG_1(finest, "possible semaphore %s timeout\n", name.c_str());
+	return (errno != EAGAIN);
 }
 
 Semaphore::~Semaphore() {
-    mach_port_t task = mach_task_self();
-    semaphore_t* semTP = reinterpret_cast<semaphore_t*>(handle);
-	semaphore_destroy(task, *semTP);
+    sem_close(reinterpret_cast<sem_t*>(handle));
+    sem_unlink(name.c_str());
 }
 
 }
