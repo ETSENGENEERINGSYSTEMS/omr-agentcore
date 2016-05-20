@@ -177,8 +177,7 @@ std::string Agent::getBuildDate() {
 }
 
 std::string Agent::getVersion() {
-	std::cout << "############# TOBES " << "\n";
-	return "TOBES 3.0.9";
+	return "3.0.9";
 }
 
 void Agent::setLogLevels() {
